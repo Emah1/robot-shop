@@ -19,8 +19,21 @@ spec:
       {{ end }}
       containers:
       - name: mysql
-        image: {{ .Values.image.repo }}/rs-mysql-db:{{ .Values.image.version }}
+        image: robotshop/rs-mysql-db:local-small
         imagePullPolicy: {{ .Values.image.pullPolicy }}
+        env:
+        - name: MALLOC_TRIM_THRESHOLD_
+          value: "131072"
+        args:
+        - "--innodb-buffer-pool-size=256M"
+        - "--innodb-ft-total-cache-size=32000000"
+        - "--innodb-ft-cache-size=1600000"
+        - "--innodb-ft-sort-pll-degree=1"
+        - "--innodb-log-buffer-size=16M"
+        - "--max-connections=50"
+        - "--performance-schema=OFF"
+        - "--tmp-table-size=16M"
+        - "--max-heap-table-size=16M"
         # added for Istio
         securityContext:
           capabilities:
@@ -29,11 +42,11 @@ spec:
         - containerPort: 3306
         resources:
           limits:
-            cpu: 200m
-            memory: 1024Mi
+            cpu: 500m
+            memory: 3Gi
           requests:
             cpu: 100m
-            memory: 700Mi
+            memory: 1Gi
       restartPolicy: Always
       {{- with .Values.mysql.affinity }}
       affinity:

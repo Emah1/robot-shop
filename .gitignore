@@ -3,3 +3,6 @@
 *-private.*
 vendor/
 Gopkg.lock
+# Local database backups and temporary tracing copies
+backups/
+dispatch/main.go.tracing-backup

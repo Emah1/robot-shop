@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -9,11 +10,17 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/instana/go-sensor"
-	ot "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
 	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/streadway/amqp"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelBridge "go.opentelemetry.io/otel/bridge/opentracing"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 const (
@@ -85,55 +92,52 @@ func rabbitConnector(uri string) {
 	}
 }
 
-func failOnError(err error, msg string) {
+func failOnError(err error, message string) {
 	if err != nil {
-		log.Fatalf("%s : %s", msg, err)
+		log.Printf("%s: %v", message, err)
 	}
 }
 
-func getOrderId(order []byte) string {
-	id := "unknown"
-	var f interface{}
-	err := json.Unmarshal(order, &f)
-	if err == nil {
-		m := f.(map[string]interface{})
-		id = m["orderid"].(string)
+func getOrderId(body []byte) string {
+	var order map[string]interface{}
+
+	if err := json.Unmarshal(body, &order); err != nil {
+		log.Printf("Failed to parse order JSON: %v", err)
+		return "unknown"
 	}
 
-	return id
+	if id, ok := order["id"]; ok {
+		return fmt.Sprint(id)
+	}
+
+	return "unknown"
 }
 
 func createSpan(headers map[string]interface{}, order string) {
-	// headers is map[string]interface{}
-	// carrier is map[string]string
-	carrier := make(ot.TextMapCarrier)
-	// convert by copying k, v
-	for k, v := range headers {
-		carrier[k] = v.(string)
+	carrier := make(opentracing.TextMapCarrier)
+
+	for key, value := range headers {
+		if str, ok := value.(string); ok {
+			carrier[key] = str
+		}
 	}
 
-	// get the order id
-	log.Printf("order %s\n", order)
+	log.Printf("Processing order %s", order)
 
-	// opentracing
-	var span ot.Span
-	tracer := ot.GlobalTracer()
-	spanContext, err := tracer.Extract(ot.HTTPHeaders, carrier)
+	tracer := opentracing.GlobalTracer()
+	spanContext, err := tracer.Extract(opentracing.TextMap, carrier)
+
+	var span opentracing.Span
 	if err == nil {
 		log.Println("Creating child span")
-		// create child span
-		span = tracer.StartSpan("getOrder", ot.ChildOf(spanContext))
-
-		fakeDataCenter := dataCenters[rand.Intn(len(dataCenters))]
-		span.SetTag("datacenter", fakeDataCenter)
+		span = tracer.StartSpan("getOrder", opentracing.ChildOf(spanContext))
 	} else {
-		log.Println(err)
-		log.Println("Failed to get context from headers")
+		log.Printf("No parent trace context found: %v", err)
 		log.Println("Creating root span")
-		// create root span
 		span = tracer.StartSpan("getOrder")
 	}
 
+	span.SetTag("datacenter", dataCenters[rand.Intn(len(dataCenters))])
 	span.SetTag(string(ext.SpanKind), ext.SpanKindConsumerEnum)
 	span.SetTag(string(ext.MessageBusDestination), "robot-shop")
 	span.SetTag("exchange", "robot-shop")
@@ -141,68 +145,113 @@ func createSpan(headers map[string]interface{}, order string) {
 	span.SetTag("address", "rabbitmq")
 	span.SetTag("key", "orders")
 	span.LogFields(otlog.String("orderid", order))
+
 	defer span.Finish()
 
 	time.Sleep(time.Duration(42+rand.Int63n(42)) * time.Millisecond)
+
 	if rand.Intn(100) < errorPercent {
 		span.SetTag("error", true)
 		span.LogFields(
 			otlog.String("error.kind", "Exception"),
-			otlog.String("message", "Failed to dispatch to SOP"))
+			otlog.String("message", "Failed to dispatch to SOP"),
+		)
 		log.Println("Span tagged with error")
 	}
 
 	processSale(span)
 }
 
-func processSale(parentSpan ot.Span) {
-	tracer := ot.GlobalTracer()
-	span := tracer.StartSpan("processSale", ot.ChildOf(parentSpan.Context()))
+func processSale(parentSpan opentracing.Span) {
+	tracer := opentracing.GlobalTracer()
+	span := tracer.StartSpan(
+		"processSale",
+		opentracing.ChildOf(parentSpan.Context()),
+	)
 	defer span.Finish()
+
 	span.SetTag(string(ext.SpanKind), "intermediate")
 	span.LogFields(otlog.String("info", "Order sent for processing"))
+
 	time.Sleep(time.Duration(42+rand.Int63n(42)) * time.Millisecond)
+}
+
+func initTracing(ctx context.Context) (func(context.Context) error, error) {
+	exporter, err := otlptracegrpc.New(
+		ctx,
+		otlptracegrpc.WithEndpoint(
+			"jaeger.monitoring.svc.cluster.local:4317",
+		),
+		otlptracegrpc.WithInsecure(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create Jaeger OTLP exporter: %w", err)
+	}
+
+	tracerProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(
+			resource.NewWithAttributes(
+				"",
+				attribute.String("service.name", Service),
+			),
+		),
+	)
+
+	bridgeTracer, wrapperProvider := otelBridge.NewTracerPair(
+		tracerProvider.Tracer(Service),
+	)
+
+	otel.SetTracerProvider(wrapperProvider)
+	opentracing.InitGlobalTracer(bridgeTracer)
+
+	return tracerProvider.Shutdown, nil
 }
 
 func main() {
 	rand.Seed(time.Now().Unix())
 
-	// Instana tracing
-	ot.InitGlobalTracer(instana.NewTracerWithOptions(&instana.Options{
-		Service:           Service,
-		LogLevel:          instana.Info,
-		EnableAutoProfile: true,
-	}))
+	ctx := context.Background()
 
-	// Init amqpUri
-	// get host from environment
+	shutdownTracing, err := initTracing(ctx)
+	if err != nil {
+		log.Fatalf("Failed to initialize tracing: %v", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cancel()
+
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			log.Printf("Failed to shut down tracing: %v", err)
+		}
+	}()
+
 	amqpHost, ok := os.LookupEnv("AMQP_HOST")
 	if !ok {
 		amqpHost = "rabbitmq"
 	}
+
 	amqpUri = fmt.Sprintf("amqp://guest:guest@%s:5672/", amqpHost)
 
-	// get error threshold from environment
 	errorPercent = 0
-	epct, ok := os.LookupEnv("DISPATCH_ERROR_PERCENT")
-	if ok {
-		epcti, err := strconv.Atoi(epct)
-		if err == nil {
-			if epcti > 100 {
-				epcti = 100
+	if epct, ok := os.LookupEnv("DISPATCH_ERROR_PERCENT"); ok {
+		if value, err := strconv.Atoi(epct); err == nil {
+			if value > 100 {
+				value = 100
 			}
-			if epcti < 0 {
-				epcti = 0
+			if value < 0 {
+				value = 0
 			}
-			errorPercent = epcti
+			errorPercent = value
 		}
 	}
-	log.Printf("Error Percent is %d\n", errorPercent)
 
-	// MQ error channel
+	log.Printf("Error Percent is %d", errorPercent)
+
 	rabbitCloseError = make(chan *amqp.Error)
-
-	// MQ ready channel
 	rabbitReady = make(chan bool)
 
 	go rabbitConnector(amqpUri)
@@ -211,19 +260,29 @@ func main() {
 
 	go func() {
 		for {
-			// wait for rabbit to be ready
 			ready := <-rabbitReady
-			log.Printf("Rabbit MQ ready %v\n", ready)
+			log.Printf("Rabbit MQ ready %v", ready)
 
-			// subscribe to bound queue
-			msgs, err := rabbitChan.Consume("orders", "", true, false, false, false, nil)
-			failOnError(err, "Failed to consume")
+			msgs, err := rabbitChan.Consume(
+				"orders",
+				"",
+				true,
+				false,
+				false,
+				false,
+				nil,
+			)
+			if err != nil {
+				failOnError(err, "Failed to consume messages")
+				continue
+			}
 
-			for d := range msgs {
-				log.Printf("Order %s\n", d.Body)
-				log.Printf("Headers %v\n", d.Headers)
-				id := getOrderId(d.Body)
-				go createSpan(d.Headers, id)
+			for delivery := range msgs {
+				log.Printf("Order %s", delivery.Body)
+				log.Printf("Headers %v", delivery.Headers)
+
+				orderID := getOrderId(delivery.Body)
+				go createSpan(delivery.Headers, orderID)
 			}
 		}
 	}()
