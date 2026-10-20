@@ -1,0 +1,31 @@
+rbac:
+  create: true
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+config:
+  outputs: |
+    [OUTPUT]
+        Name loki
+        Match kube.*
+        Host loki.monitoring.svc.cluster.local
+        Port 3100
+        Labels job=fluentbit, cluster=voting-lab, namespace=$kubernetes['namespace_name']
+        Structured_Metadata $kubernetes['pod_name'],$kubernetes['container_name']
+        Line_Format json
+        Retry_Limit False
+
+    [OUTPUT]
+        Name loki
+        Match host.*
+        Host loki.monitoring.svc.cluster.local
+        Port 3100
+        Labels job=fluentbit, cluster=voting-lab, source=node
+        Line_Format json
+        Retry_Limit False

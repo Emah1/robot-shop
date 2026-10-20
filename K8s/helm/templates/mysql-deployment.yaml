@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  labels:
+    service: mysql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      service: mysql
+  template:
+    metadata:
+      labels:
+        service: mysql
+    spec:
+      {{ if .Values.psp.enabled }}
+      serviceAccountName: robot-shop
+      {{ end }}
+      containers:
+      - name: mysql
+        image: robotshop/rs-mysql-db:local-small
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        env:
+        - name: MALLOC_TRIM_THRESHOLD_
+          value: "131072"
+        args:
+        - "--innodb-buffer-pool-size=256M"
+        - "--innodb-ft-total-cache-size=32000000"
+        - "--innodb-ft-cache-size=1600000"
+        - "--innodb-ft-sort-pll-degree=1"
+        - "--innodb-log-buffer-size=16M"
+        - "--max-connections=50"
+        - "--performance-schema=OFF"
+        - "--tmp-table-size=16M"
+        - "--max-heap-table-size=16M"
+        # added for Istio
+        securityContext:
+          capabilities:
+            add: ["NET_ADMIN"]
+        ports:
+        - containerPort: 3306
+        resources:
+          limits:
+            cpu: 500m
+            memory: 3Gi
+          requests:
+            cpu: 100m
+            memory: 1Gi
+      restartPolicy: Always
+      {{- with .Values.mysql.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mysql.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mysql.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
